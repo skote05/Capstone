@@ -1,0 +1,18 @@
+============================================================
+WEED DETECTION RESULTS - DETAILED STATISTICS
+============================================================
+
+OVERALL WEIGHTED METRICS:
+  IoU:       0.1012
+  F1-Score:  0.1650
+  Precision: 0.1112
+  Recall:    0.6286
+  Accuracy:  0.8873
+
+PER-IMAGE AVERAGES:
+  Mean IoU:  0.1037 ± 0.1280
+  Mean F1:   0.1676 ± 0.1782
+
+PIXEL STATISTICS:
+  Total GT Pixels:   17,417,111
+  Total Pred Pixels: 117,097,497
