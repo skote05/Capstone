@@ -11,7 +11,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 # ==================== CONFIGURATION ====================
 
 # Path to your saved CSV (CHANGE THIS to your actual path)
-csv_path = Path('/Users/shashankkote/Desktop2/Capstone/weed_detection_env/weed_detection/results/weed_results_20251112_011820.csv')
+csv_path = Path('/Users/shashankkote/Desktop2/Capstone/weed_detection_env/weed_detection/results/weed_results_temp (1).csv')
 
 print("="*60)
 print("WEED DETECTION RESULTS ANALYSIS")
