@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Weed Detection Test - REGION-BASED METRICS WITH FLOOD FILL
-If predicted region overlaps GT region, count ENTIRE regions as matched
+Weed Detection - Correct Flow
+1. Detect paddy plants
+2. Segment weeds (vegetation - paddy)
+3. Check if weed regions fall inside GT weed boxes
+4. Calculate metrics
 """
 
 import cv2
@@ -12,18 +15,18 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.ops import nms
 import os
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 import pandas as pd
 from tqdm import tqdm
 import time
 from pathlib import Path
 import gc
+import json
 
 # ==================== CONFIGURATION ====================
 
 BASE_DIR = Path(__file__).parent
-ORIGINAL_FOLDER = BASE_DIR / 'data' / 'originalimages_from_dataset1(greaater precision images)'
-ANNOTATED_FOLDER = BASE_DIR / 'data' / 'annotated_images'
+TEST_IMAGES_FOLDER = BASE_DIR / 'data' / 'test'
+COCO_ANNOTATION_FILE = BASE_DIR / 'data' / 'test' / '_annotations.coco.json'
 MODEL_PATH = BASE_DIR / 'data' / 'model' / 'paddy_model_with_test_data.pth'
 RESULTS_DIR = BASE_DIR / 'results'
 
@@ -32,17 +35,16 @@ torch.set_num_threads(4)
 
 RESIZE_TO = (800, 800)
 DETECTION_SCALES = [1.0, 1.25, 1.5, 2.0]
-CONFIDENCE_THRESHOLD = 0.95
+CONFIDENCE_THRESHOLD = 0.5
 NMS_THRESHOLD = 0.3
 SAVE_INTERVAL = 50
 
 RESULTS_DIR.mkdir(exist_ok=True)
 
 print("="*60)
-print("WEED DETECTION - REGION-BASED FLOOD FILL METRICS")
+print("WEED DETECTION - REGION vs BOX OVERLAP")
 print("="*60)
-print(f"Image size: {RESIZE_TO}")
-print(f"Metric: Region overlap (flood fill logic)")
+print("Flow: Detect Paddy → Segment Weeds → Match with GT Boxes")
 print("="*60)
 
 # ==================== FUNCTIONS ====================
@@ -64,24 +66,31 @@ def load_paddy_model(model_path, num_classes=2):
     print("✅ Model loaded\n")
     return model
 
-def resize_to_training_size(image, target_size=RESIZE_TO):
+
+def resize_image_and_boxes(image, boxes, target_size=RESIZE_TO):
+    """Resize image and scale bounding boxes"""
     h, w = image.shape[:2]
     target_h, target_w = target_size
     
-    scale = min(target_w / w, target_h / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
+    scale_x = target_w / w
+    scale_y = target_h / h
     
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+    resized_image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
     
-    y_offset = (target_h - new_h) // 2
-    x_offset = (target_w - new_w) // 2
-    canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+    scaled_boxes = []
+    for bbox in boxes:
+        x, y, w_box, h_box = bbox
+        x_new = x * scale_x
+        y_new = y * scale_y
+        w_new = w_box * scale_x
+        h_new = h_box * scale_y
+        scaled_boxes.append([x_new, y_new, w_new, h_new])
     
-    return canvas, scale, (x_offset, y_offset)
+    return resized_image, scaled_boxes, (scale_x, scale_y)
+
 
 def extract_shape_from_bbox(image_rgb, bbox, expansion=15):
+    """Extract paddy plant shape using green filtering"""
     h, w = image_rgb.shape[:2]
     x1, y1, x2, y2 = bbox.astype(int)
     x1, y1 = max(0, x1-expansion), max(0, y1-expansion)
@@ -102,11 +111,17 @@ def extract_shape_from_bbox(image_rgb, bbox, expansion=15):
     full_mask[y1:y2, x1:x2] = green_mask
     return full_mask
 
+
 def weed_segmentation(image_rgb, paddy_mask):
+    """
+    Segment weeds: vegetation detection - paddy regions
+    Returns binary mask of weed regions
+    """
     r = image_rgb[:,:,0].astype(np.float32)
     g = image_rgb[:,:,1].astype(np.float32)
     b = image_rgb[:,:,2].astype(np.float32)
     
+    # Vegetation detection
     exg = 2.0 * g - r - b
     exg_mask = (exg > 20).astype(np.uint8)
     green_ratio = g / (r + b + 1)
@@ -114,27 +129,29 @@ def weed_segmentation(image_rgb, paddy_mask):
     green_dom = ((g > r + 5) & (g > b + 5) & (g > 30)).astype(np.uint8)
     
     veg_mask = ((exg_mask + ratio_mask + green_dom) >= 2).astype(np.uint8) * 255
+    
+    # Remove paddy regions to get weeds
     weed_mask = veg_mask.copy()
     weed_mask[paddy_mask > 0] = 0
     
+    # Clean up
     weed_mask = cv2.morphologyEx(weed_mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
     weed_mask = cv2.morphologyEx(weed_mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+    
     return weed_mask
 
-def extract_ground_truth_weed(annotated_rgb):
-    r, g, b = annotated_rgb[:,:,0], annotated_rgb[:,:,1], annotated_rgb[:,:,2]
-    green_mask = ((g > r + 20) & (g > b + 20) & (g > 80)).astype(np.uint8) * 255
-    max_ch = np.maximum(np.maximum(r, g), b)
-    colored = ((max_ch > 80) & ((r + g + b) > 150)).astype(np.uint8) * 255
-    weed_mask = colored.copy()
-    weed_mask[green_mask > 0] = 0
-    return cv2.morphologyEx(weed_mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
 
 @torch.no_grad()
-def generate_weed_prediction_multiscale(image_rgb, model):
+def detect_paddy_and_segment_weeds(image_rgb, model):
+    """
+    Step 1: Detect paddy plants using model
+    Step 2: Segment weeds (vegetation - paddy)
+    Returns: weed_mask, paddy_mask
+    """
     h, w = image_rgb.shape[:2]
     all_boxes, all_scores, all_labels = [], [], []
     
+    # Multi-scale detection
     for scale in DETECTION_SCALES:
         if scale != 1.0:
             new_h, new_w = int(h * scale), int(w * scale)
@@ -161,6 +178,7 @@ def generate_weed_prediction_multiscale(image_rgb, model):
         all_scores.append(scores[keep])
         all_labels.append(labels[keep])
     
+    # Combine and NMS
     if len(all_boxes) > 0 and sum(len(b) for b in all_boxes) > 0:
         combined_boxes = np.concatenate(all_boxes)
         combined_scores = np.concatenate(all_scores)
@@ -177,184 +195,226 @@ def generate_weed_prediction_multiscale(image_rgb, model):
     else:
         final_boxes, final_labels = np.array([]), np.array([])
     
+    # Extract paddy regions (class 1)
     paddy_mask = np.zeros((h, w), dtype=np.uint8)
     if len(final_boxes) > 0:
         for box in final_boxes[final_labels == 1]:
             paddy_mask = cv2.bitwise_or(paddy_mask, extract_shape_from_bbox(image_rgb, box))
     
-    return weed_segmentation(image_rgb, paddy_mask)
+    # Segment weeds (vegetation - paddy)
+    weed_mask = weed_segmentation(image_rgb, paddy_mask)
+    
+    return weed_mask, paddy_mask
 
-def calculate_region_based_metrics(gt_mask, pred_mask):
+
+def check_region_box_overlap(region_mask, gt_boxes):
     """
-    FLOOD FILL LOGIC:
-    1. Find all connected regions (blobs) in GT and Pred
-    2. If ANY pixel overlap exists, count ENTIRE regions as matched
-    3. Calculate metrics based on matched regions
+    Check if predicted weed regions overlap with GT weed boxes
+    
+    Args:
+        region_mask: Binary mask of predicted weed regions
+        gt_boxes: List of GT weed boxes in [x, y, w, h] format
+    
+    Returns:
+        - Number of GT boxes with overlapping predictions
+        - Number of predicted regions
+        - IoU per GT box
     """
+    if len(gt_boxes) == 0:
+        # No GT boxes
+        num_labels, _, _, _ = cv2.connectedComponentsWithStats(
+            region_mask.astype(np.uint8), connectivity=8
+        )
+        return {
+            'gt_boxes_detected': 0,
+            'total_gt_boxes': 0,
+            'pred_regions': num_labels - 1,
+            'iou_per_box': [],
+            'avg_iou': 0.0
+        }
     
-    # Find connected components (regions) using flood fill
-    gt_num_labels, gt_labels, gt_stats, _ = cv2.connectedComponentsWithStats(
-        gt_mask.astype(np.uint8), connectivity=8
+    # Find predicted regions
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        region_mask.astype(np.uint8), connectivity=8
     )
+    num_pred_regions = num_labels - 1
     
-    pred_num_labels, pred_labels, pred_stats, _ = cv2.connectedComponentsWithStats(
-        pred_mask.astype(np.uint8), connectivity=8
-    )
+    # Check each GT box for overlap with predicted weed regions
+    gt_detected = []
+    ious = []
     
-    # Skip background (label 0)
-    gt_num_regions = gt_num_labels - 1
-    pred_num_regions = pred_num_labels - 1
-    
-    # Create masks for matched regions
-    matched_gt_mask = np.zeros_like(gt_mask)
-    matched_pred_mask = np.zeros_like(pred_mask)
-    
-    matched_gt_labels = set()
-    matched_pred_labels = set()
-    
-    # Check each GT region against each Pred region
-    for gt_label in range(1, gt_num_labels):
-        gt_region_mask = (gt_labels == gt_label).astype(np.uint8)
+    for bbox in gt_boxes:
+        x, y, w, h = bbox
+        x, y, w, h = int(x), int(y), int(w), int(h)
         
-        for pred_label in range(1, pred_num_labels):
-            pred_region_mask = (pred_labels == pred_label).astype(np.uint8)
-            
-            # Check if ANY overlap exists
-            overlap = np.logical_and(gt_region_mask, pred_region_mask).sum()
-            
-            if overlap > 0:  # ANY overlap = match!
-                # Mark ENTIRE regions as matched
-                matched_gt_mask[gt_region_mask > 0] = 255
-                matched_pred_mask[pred_region_mask > 0] = 255
-                matched_gt_labels.add(gt_label)
-                matched_pred_labels.add(pred_label)
-    
-    # Calculate metrics based on matched regions
-    num_matched_gt = len(matched_gt_labels)
-    num_matched_pred = len(matched_pred_labels)
-    
-    # Region-level metrics
-    region_precision = num_matched_pred / max(pred_num_regions, 1)
-    region_recall = num_matched_gt / max(gt_num_regions, 1)
-    region_f1 = 2 * (region_precision * region_recall) / (region_precision + region_recall + 1e-10)
-    
-    # Pixel-level metrics on MATCHED regions only
-    matched_gt_pixels = (matched_gt_mask > 0).sum()
-    matched_pred_pixels = (matched_pred_mask > 0).sum()
-    total_gt_pixels = (gt_mask > 0).sum()
-    total_pred_pixels = (pred_mask > 0).sum()
-    
-    # Overall pixel accuracy using matched regions
-    pixel_intersection = np.logical_and(matched_gt_mask, matched_pred_mask).sum()
-    pixel_union = np.logical_or(matched_gt_mask, matched_pred_mask).sum()
-    pixel_iou = pixel_intersection / pixel_union if pixel_union > 0 else 0
+        if w <= 0 or h <= 0:
+            continue
+        
+        # Create mask for this GT box
+        gt_box_mask = np.zeros(region_mask.shape, dtype=np.uint8)
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(region_mask.shape[1], x + w), min(region_mask.shape[0], y + h)
+        
+        if x2 <= x1 or y2 <= y1:
+            continue
+        
+        gt_box_mask[y1:y2, x1:x2] = 255
+        
+        # Check overlap with predicted weed regions
+        intersection = np.logical_and(region_mask > 0, gt_box_mask > 0).sum()
+        union = np.logical_or(region_mask > 0, gt_box_mask > 0).sum()
+        
+        iou = intersection / union if union > 0 else 0.0
+        ious.append(iou)
+        
+        # Consider detected if any overlap exists
+        if intersection > 0:
+            gt_detected.append(True)
+        else:
+            gt_detected.append(False)
     
     return {
-        # Region-based metrics (PRIMARY)
-        'region_precision': region_precision,
-        'region_recall': region_recall,
-        'region_f1': region_f1,
-        'region_iou': pixel_iou,  # IoU of matched regions
-        
-        # Counts
-        'gt_regions': gt_num_regions,
-        'pred_regions': pred_num_regions,
-        'matched_gt_regions': num_matched_gt,
-        'matched_pred_regions': num_matched_pred,
-        
-        # Pixel counts
-        'gt_pixels': int(total_gt_pixels),
-        'pred_pixels': int(total_pred_pixels),
-        'matched_gt_pixels': int(matched_gt_pixels),
-        'matched_pred_pixels': int(matched_pred_pixels),
-        
-        # Coverage
-        'gt_coverage': matched_gt_pixels / max(total_gt_pixels, 1),  # % of GT covered
-        'pred_coverage': matched_pred_pixels / max(total_pred_pixels, 1)  # % of Pred that matched
+        'gt_boxes_detected': sum(gt_detected),
+        'total_gt_boxes': len(gt_boxes),
+        'pred_regions': num_pred_regions,
+        'iou_per_box': ious,
+        'avg_iou': np.mean(ious) if ious else 0.0,
+        'detection_rate': sum(gt_detected) / len(gt_boxes) if len(gt_boxes) > 0 else 0.0
     }
+
 
 # ==================== MAIN ====================
 
 def main():
     start_time = time.time()
     
-    original_files = [f for f in os.listdir(ORIGINAL_FOLDER) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-    annotated_files = [f for f in os.listdir(ANNOTATED_FOLDER) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    # Load COCO annotations
+    print(f"\nLoading COCO annotations...")
+    with open(COCO_ANNOTATION_FILE, 'r') as f:
+        coco_data = json.load(f)
     
-    annotated_map = {os.path.splitext(af)[0].lower(): af for af in annotated_files}
-    matching_pairs = [(of, annotated_map[os.path.splitext(of)[0].lower()]) 
-                      for of in original_files if os.path.splitext(of)[0].lower() in annotated_map]
+    categories = {cat['id']: cat['name'] for cat in coco_data['categories']}
+    print(f"Categories: {categories}")
     
-    print(f"\nFound {len(matching_pairs)} matching pairs\n")
+    # All categories are weed-related
+    weed_cat_ids = set(categories.keys())
     
+    # Build lookups
+    image_info_dict = {img['id']: img for img in coco_data['images']}
+    
+    # Group weed annotations by image
+    image_annotations = {img_id: [] for img_id in image_info_dict.keys()}
+    for ann in coco_data['annotations']:
+        img_id = ann['image_id']
+        cat_id = ann['category_id']
+        if img_id in image_annotations and cat_id in weed_cat_ids:
+            image_annotations[img_id].append(ann['bbox'])
+    
+    total_annotations = sum(len(anns) for anns in image_annotations.values())
+    print(f"\nTotal images: {len(image_info_dict)}")
+    print(f"Total weed boxes (GT): {total_annotations}")
+    
+    # Load model
     model = load_paddy_model(MODEL_PATH)
     
-    print("Processing with FLOOD FILL region-based metrics...\n")
+    print(f"\nProcessing: Detect Paddy → Segment Weeds → Match GT Boxes\n")
     
     metrics_list = []
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    csv_path = RESULTS_DIR / f'weed_results_region_based_{timestamp}.csv'
+    csv_path = RESULTS_DIR / f'weed_results_{timestamp}.csv'
     
-    for idx, (orig_fname, annot_fname) in enumerate(tqdm(matching_pairs, desc="Progress"), 1):
+    processed = 0
+    for img_id, img_info in tqdm(image_info_dict.items(), desc="Progress"):
         try:
-            orig_bgr = cv2.imread(str(ORIGINAL_FOLDER / orig_fname))
-            annot_bgr = cv2.imread(str(ANNOTATED_FOLDER / annot_fname))
+            img_path = TEST_IMAGES_FOLDER / img_info['file_name']
             
-            if orig_bgr is None or annot_bgr is None:
+            if not img_path.exists():
                 continue
             
-            orig_resized, _, _ = resize_to_training_size(orig_bgr)
-            annot_resized, _, _ = resize_to_training_size(annot_bgr)
+            # Load image
+            image_bgr = cv2.imread(str(img_path))
+            if image_bgr is None:
+                continue
             
-            orig = cv2.cvtColor(orig_resized, cv2.COLOR_BGR2RGB)
-            annot = cv2.cvtColor(annot_resized, cv2.COLOR_BGR2RGB)
+            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
             
-            gt_weed = extract_ground_truth_weed(annot)
-            pred_weed = generate_weed_prediction_multiscale(orig, model)
+            # Get GT weed boxes
+            gt_boxes_coco = image_annotations[img_id]
             
-            # FLOOD FILL METRICS
-            m = calculate_region_based_metrics(gt_weed, pred_weed)
-            m['filename'] = orig_fname
-            metrics_list.append(m)
+            # Resize image and boxes to match training size
+            resized_rgb, scaled_boxes, _ = resize_image_and_boxes(
+                image_rgb, gt_boxes_coco, RESIZE_TO
+            )
             
-            if idx % SAVE_INTERVAL == 0:
+            # STEP 1 & 2: Detect paddy and segment weeds
+            weed_mask, paddy_mask = detect_paddy_and_segment_weeds(resized_rgb, model)
+            
+            # STEP 3: Check overlap between weed regions and GT boxes
+            overlap_metrics = check_region_box_overlap(weed_mask, scaled_boxes)
+            
+            # Calculate metrics
+            precision = overlap_metrics['gt_boxes_detected'] / max(overlap_metrics['pred_regions'], 1)
+            recall = overlap_metrics['detection_rate']
+            f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
+            
+            result = {
+                'filename': img_info['file_name'],
+                'image_id': img_id,
+                'num_gt_boxes': len(gt_boxes_coco),
+                'gt_boxes_detected': overlap_metrics['gt_boxes_detected'],
+                'pred_weed_regions': overlap_metrics['pred_regions'],
+                'detection_rate': overlap_metrics['detection_rate'],
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1,
+                'avg_iou': overlap_metrics['avg_iou'],
+                'weed_pixels': int((weed_mask > 0).sum()),
+                'paddy_pixels': int((paddy_mask > 0).sum())
+            }
+            
+            metrics_list.append(result)
+            processed += 1
+            
+            if processed % SAVE_INTERVAL == 0:
                 pd.DataFrame(metrics_list).to_csv(csv_path, index=False)
                 gc.collect()
             
         except Exception as e:
-            print(f"\nError on {orig_fname}: {e}")
+            print(f"\nError on {img_info['file_name']}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
     
+    # Final save
     df = pd.DataFrame(metrics_list)
     df.to_csv(csv_path, index=False)
     
     elapsed = time.time() - start_time
     
+    # Results
     print(f"\n{'='*60}")
-    print("RESULTS - REGION-BASED FLOOD FILL METRICS")
+    print("RESULTS - WEED REGION vs GT BOX OVERLAP")
     print(f"{'='*60}")
     print(f"Processed: {len(metrics_list)} images")
     print(f"Time: {elapsed/60:.1f} minutes\n")
     
-    print(f"📊 REGION-BASED METRICS (Primary):")
-    print(f"  Mean Precision: {df['region_precision'].mean():.4f}")
-    print(f"  Mean Recall:    {df['region_recall'].mean():.4f}")
-    print(f"  Mean F1:        {df['region_f1'].mean():.4f}")
-    print(f"  Mean IoU:       {df['region_iou'].mean():.4f}")
+    print(f"📊 DETECTION METRICS:")
+    print(f"  Detection Rate (Recall): {df['detection_rate'].mean():.4f}")
+    print(f"  Precision:               {df['precision'].mean():.4f}")
+    print(f"  F1 Score:                {df['f1_score'].mean():.4f}")
+    print(f"  Mean IoU:                {df['avg_iou'].mean():.4f}")
     
-    print(f"\n📈 Region Detection Stats:")
-    print(f"  Avg GT regions:      {df['gt_regions'].mean():.1f}")
-    print(f"  Avg Pred regions:    {df['pred_regions'].mean():.1f}")
-    print(f"  Avg Matched (GT):    {df['matched_gt_regions'].mean():.1f}")
-    print(f"  Avg Matched (Pred):  {df['matched_pred_regions'].mean():.1f}")
+    print(f"\n📈 Statistics:")
+    print(f"  Total GT weed boxes:      {df['num_gt_boxes'].sum()}")
+    print(f"  GT boxes detected:        {df['gt_boxes_detected'].sum()}")
+    print(f"  Total pred weed regions:  {df['pred_weed_regions'].sum()}")
+    print(f"  Avg GT boxes/image:       {df['num_gt_boxes'].mean():.1f}")
+    print(f"  Avg detected/image:       {df['gt_boxes_detected'].mean():.1f}")
+    print(f"  Avg weed regions/image:   {df['pred_weed_regions'].mean():.1f}")
     
-    print(f"\n📏 Coverage:")
-    print(f"  GT Coverage:   {df['gt_coverage'].mean():.2%} (% of GT matched)")
-    print(f"  Pred Coverage: {df['pred_coverage'].mean():.2%} (% of Pred valid)")
-    
-    print(f"\n{'='*60}")
-    print(f"✅ Saved: {csv_path.name}")
+    print(f"\n✅ Saved: {csv_path.name}")
     print(f"{'='*60}")
+
 
 if __name__ == "__main__":
     main()
