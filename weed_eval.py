@@ -33,9 +33,9 @@ torch.set_num_threads(4)
 # ==================== TUNABLE THRESHOLDS ====================
 # Updated based on visual analysis success
 RESIZE_TO = (800, 800)
-DETECTION_SCALES = [1.0, 1.5]  # Reduced from [1.0, 1.25, 1.5, 2.0] for speed
+DETECTION_SCALES = [1.0, 1.5, 2.0]  # Reduced from [1.0, 1.25, 1.5, 2.0] for speed
 CONFIDENCE_THRESHOLD = 0.3    # Increased from 0.5 based on visual results
-NMS_THRESHOLD = 0.3
+NMS_THRESHOLD = 0.25
 
 # Weed segmentation thresholds (from visual code)
 EXG_THRESHOLD = 20
