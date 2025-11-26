@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Weed Detection - Mac Version (Updated)
+Weed Detection - Mac Version (Updated with Accuracy)
 Uses COCO annotations with improved detection from visual analysis
 """
 
@@ -19,37 +19,36 @@ from pathlib import Path
 import gc
 import json
 
+
 # ==================== CONFIGURATION ====================
 
 BASE_DIR = Path(__file__).parent
 TEST_IMAGES_FOLDER = BASE_DIR / 'data' / 'test'
 COCO_ANNOTATION_FILE = BASE_DIR / 'data' / 'test' / '_annotations.coco.json'
-MODEL_PATH = BASE_DIR / 'data' / 'model' / 'paddy_model_with_test_data.pth'
+MODEL_PATH = BASE_DIR / 'data' / 'model' / 'paddy_detection_model_combined.pth'
 RESULTS_DIR = BASE_DIR / 'results'
 
 device = torch.device("cpu")
 torch.set_num_threads(4)
 
 # ==================== TUNABLE THRESHOLDS ====================
-# Updated based on visual analysis success
 RESIZE_TO = (800, 800)
-DETECTION_SCALES = [1.0, 1.25, 1.5, 2.0]  # Reduced from [1.0, 1.25, 1.5, 2.0] for speed
-CONFIDENCE_THRESHOLD = 0.8    # Increased from 0.5 based on visual results
-NMS_THRESHOLD = 0.15
+DETECTION_SCALES = [1.0, 1.25, 1.5, 2.0]
+CONFIDENCE_THRESHOLD = 0.8
+NMS_THRESHOLD = 0.1
 
-# Weed segmentation thresholds (from visual code)
 EXG_THRESHOLD = 20
 GREEN_RATIO_THRESHOLD = 1.1
-PADDY_EXPANSION = 15           # Expansion around paddy bbox
+PADDY_EXPANSION = 15
 
 SAVE_INTERVAL = 50
 
 RESULTS_DIR.mkdir(exist_ok=True)
 
 print("="*60)
-print("WEED DETECTION - UPDATED MAC VERSION")
+print("WEED DETECTION - UPDATED MAC VERSION WITH ACCURACY")
 print("="*60)
-print(f"🔧 Settings (from visual analysis):")
+print(f"🔧 Settings:")
 print(f"  Confidence: {CONFIDENCE_THRESHOLD}")
 print(f"  Detection scales: {DETECTION_SCALES}")
 print(f"  Image size: {RESIZE_TO}")
@@ -74,9 +73,8 @@ def load_paddy_model(model_path, num_classes=2):
     print("✅ Model loaded\n")
     return model
 
-
 def resize_to_training_size(image, target_size=RESIZE_TO):
-    """Resize with padding to maintain aspect ratio (from visual code)"""
+    """Resize with padding to maintain aspect ratio"""
     h, w = image.shape[:2]
     target_h, target_w = target_size
     
@@ -93,7 +91,6 @@ def resize_to_training_size(image, target_size=RESIZE_TO):
     
     return canvas, scale, (x_offset, y_offset)
 
-
 def resize_boxes_to_canvas(boxes, scale, offset):
     """Scale COCO boxes to match resized canvas"""
     x_offset, y_offset = offset
@@ -101,21 +98,16 @@ def resize_boxes_to_canvas(boxes, scale, offset):
     
     for bbox in boxes:
         x, y, w, h = bbox
-        # Scale
-        x_new = x * scale
-        y_new = y * scale
+        x_new = x * scale + x_offset
+        y_new = y * scale + y_offset
         w_new = w * scale
         h_new = h * scale
-        # Add offset
-        x_new += x_offset
-        y_new += y_offset
         scaled_boxes.append([x_new, y_new, w_new, h_new])
     
     return scaled_boxes
 
-
 def extract_shape_from_bbox(image_rgb, bbox, expansion=PADDY_EXPANSION):
-    """Extract paddy shape from bbox (from visual code)"""
+    """Extract paddy shape from bbox"""
     h, w = image_rgb.shape[:2]
     x1, y1, x2, y2 = bbox.astype(int)
     x1, y1 = max(0, x1-expansion), max(0, y1-expansion)
@@ -136,14 +128,12 @@ def extract_shape_from_bbox(image_rgb, bbox, expansion=PADDY_EXPANSION):
     full_mask[y1:y2, x1:x2] = green_mask
     return full_mask
 
-
 def weed_segmentation(image_rgb, paddy_mask):
-    """Weed segmentation (from visual code)"""
+    """Weed segmentation"""
     r = image_rgb[:,:,0].astype(np.float32)
     g = image_rgb[:,:,1].astype(np.float32)
     b = image_rgb[:,:,2].astype(np.float32)
     
-    # Vegetation detection
     exg = 2.0 * g - r - b
     exg_mask = (exg > EXG_THRESHOLD).astype(np.uint8)
     green_ratio = g / (r + b + 1)
@@ -152,20 +142,17 @@ def weed_segmentation(image_rgb, paddy_mask):
     
     veg_mask = ((exg_mask + ratio_mask + green_dom) >= 2).astype(np.uint8) * 255
     
-    # Remove paddy
     weed_mask = veg_mask.copy()
     weed_mask[paddy_mask > 0] = 0
     
-    # Clean up
     weed_mask = cv2.morphologyEx(weed_mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
     weed_mask = cv2.morphologyEx(weed_mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
     
     return weed_mask
 
-
 @torch.no_grad()
 def generate_weed_prediction_multiscale(image_rgb, model):
-    """Multi-scale detection (from visual code)"""
+    """Multi-scale detection"""
     h, w = image_rgb.shape[:2]
     all_boxes, all_scores, all_labels = [], [], []
     
@@ -195,7 +182,6 @@ def generate_weed_prediction_multiscale(image_rgb, model):
         all_scores.append(scores[keep])
         all_labels.append(labels[keep])
     
-    # Combine and NMS
     if len(all_boxes) > 0 and sum(len(b) for b in all_boxes) > 0:
         combined_boxes = np.concatenate(all_boxes)
         combined_scores = np.concatenate(all_scores)
@@ -212,7 +198,6 @@ def generate_weed_prediction_multiscale(image_rgb, model):
     else:
         final_boxes, final_labels = np.array([]), np.array([])
     
-    # Extract paddy regions
     paddy_mask = np.zeros((h, w), dtype=np.uint8)
     if len(final_boxes) > 0:
         for box in final_boxes[final_labels == 1]:
@@ -220,17 +205,41 @@ def generate_weed_prediction_multiscale(image_rgb, model):
     
     return weed_segmentation(image_rgb, paddy_mask)
 
-
 def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
     """
-    Calculate metrics: predicted weed regions vs GT weed boxes
-    Uses flood fill logic from visual code
+    Calculate metrics including accuracy:
+    - Region-based metrics (precision, recall, F1, IoU)
+    - Pixel-level accuracy
+    - Region classification accuracy
     """
     # Find predicted weed regions
     pred_num_labels, pred_labels, pred_stats, _ = cv2.connectedComponentsWithStats(
         pred_weed_mask.astype(np.uint8), connectivity=8
     )
     pred_num_regions = pred_num_labels - 1
+    
+    # Create GT mask from boxes
+    gt_mask = np.zeros(image_shape[:2], dtype=np.uint8)
+    for bbox in gt_boxes:
+        x, y, w, h = bbox
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        if w > 0 and h > 0:
+            x1, y1 = max(0, x), max(0, y)
+            x2, y2 = min(image_shape[1], x + w), min(image_shape[0], y + h)
+            if x2 > x1 and y2 > y1:
+                gt_mask[y1:y2, x1:x2] = 255
+    
+    # Pixel-level accuracy calculation
+    pred_binary = (pred_weed_mask > 0).astype(np.uint8)
+    gt_binary = (gt_mask > 0).astype(np.uint8)
+    
+    total_pixels = image_shape[0] * image_shape[1]
+    true_positives_pixels = np.logical_and(pred_binary == 1, gt_binary == 1).sum()
+    true_negatives_pixels = np.logical_and(pred_binary == 0, gt_binary == 0).sum()
+    false_positives_pixels = np.logical_and(pred_binary == 1, gt_binary == 0).sum()
+    false_negatives_pixels = np.logical_and(pred_binary == 0, gt_binary == 1).sum()
+    
+    pixel_accuracy = (true_positives_pixels + true_negatives_pixels) / total_pixels
     
     # Handle empty GT
     if len(gt_boxes) == 0:
@@ -239,6 +248,8 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
             'region_recall': 0.0,
             'region_f1': 0.0,
             'region_iou': 0.0,
+            'pixel_accuracy': pixel_accuracy,
+            'region_accuracy': 1.0 if pred_num_regions == 0 else 0.0,
             'gt_regions': 0,
             'pred_regions': pred_num_regions,
             'matched_gt_regions': 0,
@@ -264,7 +275,6 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
         if w <= 0 or h <= 0:
             continue
         
-        # Create GT box mask
         gt_box_mask = np.zeros(image_shape[:2], dtype=np.uint8)
         x1, y1 = max(0, x), max(0, y)
         x2, y2 = min(image_shape[1], x + w), min(image_shape[0], y + h)
@@ -274,14 +284,12 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
         
         gt_box_mask[y1:y2, x1:x2] = 255
         
-        # Check overlap with each predicted region
         for pred_label in range(1, pred_num_labels):
             pred_region_mask = (pred_labels == pred_label).astype(np.uint8) * 255
             
-            # Calculate overlap
             intersection = np.logical_and(pred_region_mask > 0, gt_box_mask > 0).sum()
             
-            if intersection > 0:  # Any overlap counts as match
+            if intersection > 0:
                 union = np.logical_or(pred_region_mask > 0, gt_box_mask > 0).sum()
                 iou = intersection / union if union > 0 else 0.0
                 ious.append(iou)
@@ -294,7 +302,6 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
     for pred_label in matched_pred_regions:
         matched_pred_pixels += (pred_labels == pred_label).sum()
     
-    # GT pixels (total area of all GT boxes)
     gt_pixels = 0
     matched_gt_pixels = 0
     for gt_idx, bbox in enumerate(gt_boxes):
@@ -308,7 +315,7 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
     
     pred_pixels = int((pred_weed_mask > 0).sum())
     
-    # Calculate metrics
+    # Region-based metrics
     num_matched_gt = len(matched_gt_boxes)
     num_matched_pred = len(matched_pred_regions)
     
@@ -316,6 +323,14 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
     region_recall = num_matched_gt / max(len(gt_boxes), 1)
     region_f1 = 2 * (region_precision * region_recall) / (region_precision + region_recall + 1e-10)
     region_iou = np.mean(ious) if ious else 0.0
+    
+    # Region classification accuracy: (correctly matched + correctly rejected) / total
+    # TP regions = matched predictions
+    # TN regions = correctly not predicted (hard to quantify, skip for simplicity)
+    # Simplified: accuracy based on correct matches vs total GT + predictions
+    total_regions = len(gt_boxes) + pred_num_regions
+    correct_regions = num_matched_gt + num_matched_pred  # Count matches twice (GT and pred sides)
+    region_accuracy = correct_regions / max(total_regions, 1)
     
     gt_coverage = matched_gt_pixels / max(gt_pixels, 1)
     pred_coverage = matched_pred_pixels / max(pred_pixels, 1)
@@ -325,6 +340,8 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
         'region_recall': region_recall,
         'region_f1': region_f1,
         'region_iou': region_iou,
+        'pixel_accuracy': pixel_accuracy,
+        'region_accuracy': region_accuracy,
         'gt_regions': len(gt_boxes),
         'pred_regions': pred_num_regions,
         'matched_gt_regions': num_matched_gt,
@@ -337,23 +354,19 @@ def calculate_region_based_metrics(pred_weed_mask, gt_boxes, image_shape):
         'pred_coverage': pred_coverage
     }
 
-
 # ==================== MAIN ====================
 
 def main():
     start_time = time.time()
     
-    # Load COCO annotations
     print(f"\nLoading COCO annotations...")
     with open(COCO_ANNOTATION_FILE, 'r') as f:
         coco_data = json.load(f)
     
-    # Get categories
     categories = {cat['id']: cat['name'] for cat in coco_data['categories']}
     weed_cat_ids = set(categories.keys())
     print(f"Categories: {categories}")
     
-    # Build lookups
     image_info_dict = {img['id']: img for img in coco_data['images']}
     image_annotations = {img_id: [] for img_id in image_info_dict.keys()}
     
@@ -366,7 +379,6 @@ def main():
     print(f"Total images: {len(image_info_dict)}")
     print(f"Total weed boxes: {sum(len(anns) for anns in image_annotations.values())}")
     
-    # Load model
     model = load_paddy_model(MODEL_PATH)
     
     print(f"\nProcessing with updated settings...\n")
@@ -383,7 +395,6 @@ def main():
             if not img_path.exists():
                 continue
             
-            # Load image
             image_bgr = cv2.imread(str(img_path))
             if image_bgr is None:
                 continue
@@ -391,16 +402,11 @@ def main():
             image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
             gt_boxes_coco = image_annotations[img_id]
             
-            # Resize with padding (like visual code)
             resized_rgb, scale, offset = resize_to_training_size(image_rgb, RESIZE_TO)
-            
-            # Scale GT boxes to resized canvas
             scaled_boxes = resize_boxes_to_canvas(gt_boxes_coco, scale, offset)
             
-            # Detect paddy and segment weeds
             pred_weed_mask = generate_weed_prediction_multiscale(resized_rgb, model)
             
-            # Calculate metrics
             metrics = calculate_region_based_metrics(
                 pred_weed_mask, scaled_boxes, resized_rgb.shape
             )
@@ -418,7 +424,6 @@ def main():
             print(f"\nError on {img_info.get('file_name', 'unknown')}: {e}")
             continue
     
-    # Final save
     df = pd.DataFrame(metrics_list)
     df.to_csv(csv_path, index=False)
     
@@ -426,16 +431,20 @@ def main():
     
     # Results
     print(f"\n{'='*60}")
-    print("RESULTS - UPDATED MAC VERSION")
+    print("RESULTS - WITH ACCURACY METRICS")
     print(f"{'='*60}")
     print(f"Processed: {len(metrics_list)} images")
     print(f"Time: {elapsed/60:.1f} minutes\n")
     
     print(f"📊 REGION-BASED METRICS:")
-    print(f"  Mean Precision: {df['region_precision'].mean():.4f}")
-    print(f"  Mean Recall:    {df['region_recall'].mean():.4f}")
-    print(f"  Mean F1:        {df['region_f1'].mean():.4f}")
-    print(f"  Mean IoU:       {df['region_iou'].mean():.4f}")
+    print(f"  Precision:       {df['region_precision'].mean():.4f}")
+    print(f"  Recall:          {df['region_recall'].mean():.4f}")
+    print(f"  F1-Score:        {df['region_f1'].mean():.4f}")
+    print(f"  IoU:             {df['region_iou'].mean():.4f}")
+    print(f"  Region Accuracy: {df['region_accuracy'].mean():.4f}")
+    
+    print(f"\n🎯 PIXEL-LEVEL METRICS:")
+    print(f"  Pixel Accuracy:  {df['pixel_accuracy'].mean():.4f} ({df['pixel_accuracy'].mean()*100:.2f}%)")
     
     print(f"\n📈 Detection Stats:")
     print(f"  Total GT boxes:        {df['gt_regions'].sum()}")
@@ -449,7 +458,6 @@ def main():
     
     print(f"\n✅ Saved: {csv_path.name}")
     print(f"{'='*60}")
-
 
 if __name__ == "__main__":
     main()
