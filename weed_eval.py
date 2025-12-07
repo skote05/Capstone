@@ -25,7 +25,7 @@ import json
 BASE_DIR = Path(__file__).parent
 TEST_IMAGES_FOLDER = BASE_DIR / 'data' / 'test'
 COCO_ANNOTATION_FILE = BASE_DIR / 'data' / 'test' / '_annotations.coco.json'
-MODEL_PATH = BASE_DIR / 'data' / 'model' / 'paddy_detection_model_combined.pth'
+MODEL_PATH = BASE_DIR / 'data' / 'model' / 'paddy_model_with_test_data.pth'
 RESULTS_DIR = BASE_DIR / 'results'
 
 device = torch.device("cpu")
